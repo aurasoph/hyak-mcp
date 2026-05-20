@@ -1,5 +1,6 @@
 import sys
 import logging
+import shlex
 import functools
 from mcp.server.fastmcp import FastMCP
 
@@ -179,8 +180,45 @@ def help_jobs() -> str:
     return """
 # SLURM Job Scheduling on Klone
 
-- **Interactive (`salloc`):** Use for debugging.
-  `salloc --partition=ckpt-all --cpus-per-task=1 --mem=10G --time=2:00:00`
+- **Interactive / persistent compute across multiple commands:** prefer the
+  `klone_compute` tool — it does the bash recipe below in one call,
+  idempotent by job name.
+
+  **Before sustained use, ask the human which account and partition
+  to use.** Show them `klone_run("hyakalloc")` output (their actual
+  accounts and partition access) and let them choose; don't silently
+  pick a default. The default in `klone_compute` is preemptible
+  ckpt-all — fine for smoke tests, usually wrong for hour-long work.
+
+  Raw form if you need behavior the tool doesn't cover:
+
+  ```bash
+  # 1. Find or create a named allocation
+  ID=$(squeue --me --name=devshell -h -o "%i" --states=R,CF)
+  if [ -z "$ID" ]; then
+      OUT=$(salloc --no-shell --job-name=devshell \\
+          --partition=ckpt-all --cpus-per-task=4 --mem=10G --time=2:00:00 2>&1)
+      ID=$(echo "$OUT" | grep -oE 'job allocation [0-9]+' | awk '{print $3}')
+      # allocation grant can take ~minutes on busy partitions
+      while [ "$(squeue -j $ID -h -o %T)" != "RUNNING" ]; do sleep 1; done
+  fi
+
+  # 2. Run any number of commands. --overlap lets them share the
+  #    allocation in parallel rather than queuing.
+  srun --jobid=$ID --overlap hostname
+  srun --jobid=$ID --overlap python script.py
+  srun --jobid=$ID --overlap nvidia-smi      # if you allocated a GPU
+
+  # 3. Release when done (or let walltime expire)
+  scancel -n devshell
+  ```
+
+  Bump `klone_run` `timeout=` past 60 s for the salloc call — allocation
+  grant on a busy partition can outlast the default.
+
+- **One-shot interactive:** for a single command on a compute node, plain
+  `salloc <flags> <command>` runs cmd and releases — no name needed.
+  `salloc --partition=ckpt-all --cpus-per-task=1 --mem=10G --time=2:00:00 hostname`
 
 - **Batch (`sbatch`):** Write the script with a heredoc in one shell
   command, then submit. Pass the whole block as a single string argument
@@ -251,13 +289,7 @@ The `reason` field of `squeue` tells you. Common ones:
 - `ReqNodeNotAvail` — the partition is in a maintenance window; pick
   a shorter `--time` to slot before maintenance or wait
 
-## References
-- https://hyak.uw.edu/docs/hyak101/basics/jobs — concise jobs intro
-- https://hyak.uw.edu/docs/compute/scheduling-jobs — partitions, fairshare, pending reasons
-- https://hyak.uw.edu/docs/hyak101/basics/syllabus_slurm — beginner
-  SLURM tutorial (accounts, partitions, ckpt, GPU requests, queue monitoring)
-- https://hyak.uw.edu/docs/hyak101/basics/syllabus_advanced — advanced
-  SLURM tutorial (interactive vs batch, parallelism, parameter sweep)
+*Reference: https://hyak.uw.edu/docs/compute/scheduling-jobs (also: https://hyak.uw.edu/docs/hyak101/basics/jobs, https://hyak.uw.edu/docs/hyak101/basics/syllabus_slurm, https://hyak.uw.edu/docs/hyak101/basics/syllabus_advanced)*
 """
 
 
@@ -287,11 +319,7 @@ CURRENT_DROPOUT=${DROPOUT[${SLURM_ARRAY_TASK_ID} % 3]}
 - `klone://help/jobs` — sbatch/salloc fundamentals, partition catalog
 - `klone://help/monitoring` — collect array-job results, find which task failed
 
-## References
-- https://hyak.uw.edu/docs/hyak101/basics/nn_sweep — neural-network
-  parameter sweep walkthrough
-- https://hyak.uw.edu/docs/hyak101/basics/syllabus_advanced — advanced
-  SLURM tutorial that covers parameter sweeps in depth
+*Reference: https://hyak.uw.edu/docs/hyak101/basics/nn_sweep (also: https://hyak.uw.edu/docs/hyak101/basics/syllabus_advanced)*
 """
 
 
@@ -641,9 +669,7 @@ Common gotchas:
 - `klone://help/checkpoint` — ckpt partitions include GPU nodes; expect preemption
 - `klone://help/monitoring` — `nvidia-smi` on the allocated node, sacct for diagnosing OOM
 
-## References
-- https://hyak.uw.edu/docs/gpus/gpu_start — GPU types, partitions, requesting
-- https://hyak.uw.edu/docs/gpus/nvidia_ngc — NVIDIA NGC container catalog usage
+*Reference: https://hyak.uw.edu/docs/gpus/gpu_start (also: https://hyak.uw.edu/docs/gpus/nvidia_ngc)*
 """
 
 
@@ -858,7 +884,94 @@ def klone_run(cmd: str, timeout: int = 60) -> str:
     topics (SLURM, GPUs, containers, MATLAB, R, Jupyter, etc). Reading it
     once saves repeated trial-and-error.
     """
+    # Empty/whitespace-only commands would otherwise open an interactive
+    # login shell and hang until the timeout fires.
+    if not cmd or not cmd.strip():
+        return ""
     return run_ssh(cmd, timeout=timeout)
+
+
+@mcp.tool()
+@handle_ssh_errors
+def klone_compute(
+    name: str,
+    cmd: str,
+    salloc_args: str = "--partition=ckpt-all --cpus-per-task=4 --mem=10G --time=2:00:00",
+    timeout: int = 120,
+) -> str:
+    """
+    Run `cmd` on a named persistent compute allocation. Idempotent.
+
+    On the first call with a given `name`, runs
+        salloc --no-shell --job-name=<name> <salloc_args>
+    to reserve compute resources. The allocation persists across MCP calls.
+    On subsequent calls with the same name, the existing allocation is
+    reused (no new salloc). The command runs via
+        srun --jobid=<id> --overlap bash -c <cmd>
+    The `--overlap` flag is the key bit: multiple concurrent klone_compute
+    calls with the same name share the allocation's CPUs/GPUs/mem in
+    parallel rather than queuing behind each other.
+
+    Use this for iterative compute-node work: short builds, GPU smoke
+    tests, interactive Python on a real node, debugging across many
+    commands. For one-shot long jobs use sbatch via klone_run.
+
+    To release: `klone_run("scancel -n <name>")` — or let walltime expire.
+    Walltime is the safety net; set `--time=` in `salloc_args`
+    appropriately.
+
+    **Before any sustained or multi-hour use, ASK THE HUMAN which account
+    and partition they want.** Run `klone_run("hyakalloc")` first to
+    surface their available accounts/partitions, show that output, and
+    let them choose. The default `salloc_args` targets ckpt-all
+    (preemptible, no account needed, 4 CPU / 10 GB / 2 h) — that's only
+    appropriate for one-off smoke tests where preemption is fine. For
+    real work the human's own account is usually non-preemptible and
+    what they actually want. Picking ckpt-all silently for an hour-long
+    job is a regret.
+
+    For GPU:
+        klone_compute("dev", "nvidia-smi",
+            salloc_args="--partition=ckpt-all --gres=gpu:rtx6k:1 --mem=20G --time=2:00:00")
+
+    Bump `timeout` if allocation grant is slow on a busy partition (the
+    internal wait loop is up to 60 s on top of cmd duration).
+
+    See `klone://help/jobs` ("Interactive / persistent compute") for the
+    underlying bash recipe.
+    """
+    if not name or not name.strip():
+        raise ValueError("klone_compute: name must be non-empty")
+    if any(c in name for c in " \t\n'\"`;|&"):
+        raise ValueError(f"klone_compute: invalid name {name!r} (no whitespace, quotes, or shell metachars)")
+    if not cmd or not cmd.strip():
+        return ""
+
+    safe_name = shlex.quote(name)
+    safe_cmd = shlex.quote(cmd)
+    # salloc_args is intentionally NOT shell-quoted: it's a fragment of
+    # SLURM flags that must be word-split (e.g. "--partition=X --mem=Y" must
+    # become two args, not one). The agent already has full bash via
+    # klone_run, so unquoted args here are not a new attack surface.
+    recipe = f"""set -e
+ID=$(squeue --me --name={safe_name} -h -o "%i" --states=R,CF | head -1)
+if [ -z "$ID" ]; then
+    OUT=$(salloc --no-shell --job-name={safe_name} {salloc_args} 2>&1)
+    ID=$(echo "$OUT" | grep -oE 'job allocation [0-9]+' | awk '{{print $3}}')
+    if [ -z "$ID" ]; then
+        echo "Allocation failed. salloc output:" >&2
+        echo "$OUT" >&2
+        exit 2
+    fi
+    for _ in $(seq 1 60); do
+        STATE=$(squeue -j "$ID" -h -o "%T" 2>/dev/null)
+        [ "$STATE" = "RUNNING" ] && break
+        sleep 1
+    done
+fi
+srun --jobid="$ID" --overlap bash -c {safe_cmd}
+"""
+    return run_ssh(recipe, timeout=timeout)
 
 
 if __name__ == "__main__":
