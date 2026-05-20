@@ -953,13 +953,16 @@ def klone_compute(
     # SLURM flags that must be word-split (e.g. "--partition=X --mem=Y" must
     # become two args, not one). The agent already has full bash via
     # klone_run, so unquoted args here are not a new attack surface.
-    recipe = f"""set -e
-ID=$(squeue --me --name={safe_name} -h -o "%i" --states=R,CF | head -1)
+    # Don't use `set -e`: it aborts at `OUT=$(salloc ... 2>&1)` on salloc
+    # failure before the "Allocation failed" branch can surface the real
+    # error, leaving the caller with an opaque non-zero SSH exit.
+    recipe = f"""ID=$(squeue --me --name={safe_name} -h -o "%i" --states=R,CF | head -1)
 if [ -z "$ID" ]; then
     OUT=$(salloc --no-shell --job-name={safe_name} {salloc_args} 2>&1)
+    RC=$?
     ID=$(echo "$OUT" | grep -oE 'job allocation [0-9]+' | awk '{{print $3}}')
-    if [ -z "$ID" ]; then
-        echo "Allocation failed. salloc output:" >&2
+    if [ $RC -ne 0 ] || [ -z "$ID" ]; then
+        echo "Allocation failed (salloc exit $RC). salloc output:" >&2
         echo "$OUT" >&2
         exit 2
     fi
