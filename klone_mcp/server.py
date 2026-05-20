@@ -1,6 +1,5 @@
 import sys
 import logging
-import shlex
 import functools
 from mcp.server.fastmcp import FastMCP
 
@@ -63,7 +62,9 @@ on klone. You have all of bash and the klone-specific utilities listed
 in `klone://docs/commands` available.
 
 - **Interactive:** `klone_run("salloc --partition=ckpt-all --cpus-per-task=1 --mem=10G --time=2:00:00")`
-- **Batch submit:** Use `klone_put_file` to write the script, then `klone_run("sbatch /path/to/script.sh")`.
+- **Batch submit:** Write the script with a heredoc, then `sbatch` it — both in one `klone_run` call:
+  `klone_run("cat > /tmp/job.sh <<'EOF'\\n#!/bin/bash\\n#SBATCH ...\\n<commands>\\nEOF\\nsbatch /tmp/job.sh")`
+  The `'EOF'` (quoted) keeps the body verbatim — no `$var` expansion in the script body.
 - **Discovery:** `klone_run("hyakalloc")` for accounts, `klone_run("hyakstorage")` for quotas.
 
 ## AUTHENTICATION (DUO)
@@ -112,6 +113,21 @@ def get_commands() -> str:
 
 Invoke these with `klone_run("...")`. The agent already knows standard
 Linux commands; this list covers klone-specific tools and conventions.
+
+## Discipline — scope every query
+
+Klone is a shared cluster. Never run unscoped queries; they waste context
+and give noisy answers.
+
+- `squeue` alone → tens of thousands of rows. Use `squeue --me` or
+  `squeue -u <netid>`, and always with `-o '<short format>'` or
+  `--Format=...`.
+- `squeue --me --name=<jobname>` when you know the job name — much less
+  noise than parsing the full --me list.
+- `sinfo` alone → every partition. Scope with `-p <partition>` or pipe
+  through `head`.
+- `find /gscratch ...` without bounds is a footgun — limit depth, use
+  `-maxdepth`, target a specific subtree.
 
 ## Discovery / orientation
 - `whoami` — your UW NetID
@@ -166,18 +182,30 @@ def help_jobs() -> str:
 - **Interactive (`salloc`):** Use for debugging.
   `salloc --partition=ckpt-all --cpus-per-task=1 --mem=10G --time=2:00:00`
 
-- **Batch (`sbatch`):** Write a script via `klone_put_file`, then submit.
-```bash
-#!/bin/bash
-#SBATCH --job-name=my_job
-#SBATCH --partition=compute
-#SBATCH --account=my_account
-#SBATCH --nodes=1
-#SBATCH --mem=10G
-#SBATCH --time=04:00:00
-#SBATCH -o log/%x_%j.out  # %x=name, %j=jobID
-```
-Then: `klone_run("sbatch /path/to/job.sh")`
+- **Batch (`sbatch`):** Write the script with a heredoc in one shell
+  command, then submit. Pass the whole block as a single string argument
+  to `klone_run` — Python triple-quoted strings keep the newlines:
+  ```
+  klone_run(
+    "cat > /tmp/job.sh <<'EOF'\\n"
+    "#!/bin/bash\\n"
+    "#SBATCH --job-name=my_job\\n"
+    "#SBATCH --partition=compute\\n"
+    "#SBATCH --account=my_account\\n"
+    "#SBATCH --nodes=1\\n"
+    "#SBATCH --mem=10G\\n"
+    "#SBATCH --time=04:00:00\\n"
+    "#SBATCH -o log/%x_%j.out\\n"
+    "echo hi\\n"
+    "EOF\\n"
+    "sbatch /tmp/job.sh"
+  )
+  ```
+  The `'EOF'` is quoted so the body is verbatim (no `$VAR` expansion in
+  the script). After submitting, **verify the job actually entered the
+  queue** — a zero-exit from `sbatch` is necessary but not sufficient
+  (a buggy wrapper or detached tmux can swallow the real error). Confirm:
+  `klone_run("squeue --me --name=<jobname> --Format=JobID,State,Reason --noheader")`
 
 - **GPUs:**
   Find idle GPUs: `sinfo -p ckpt-all -O nodehost,gres,gresused`
@@ -532,22 +560,44 @@ def help_gpus() -> str:
 | A100 | 40 GB HBM2 | account-specific |
 | P100 | 16 GB HBM2 | older |
 
-## Requesting GPUs
+## Partition vs GRES — they are independent
 
-**Checkpoint (preemptible, no account needed):**
+This trips agents up. SLURM has two separate concepts:
+
+- **Partition** (`--partition=`) — which queue to submit to. Examples:
+  `compute`, `ckpt-all`, `gpu-rtx6k`. The partition name *sometimes*
+  implies a GPU type (e.g. `gpu-rtx6k`), but not always (e.g. `ckpt-all`
+  has every GPU type the contributors donate).
+- **GRES** (`--gres=gpu:<type>:N` or `--gpus-per-node=<type>:N`) —
+  *which kind* of GPU and how many.
+
+`gpu-rtx6` is **not** a partition (the real one is `gpu-rtx6k`). Don't
+guess names — see the actual mapping:
+
 ```bash
-salloc --partition=ckpt-all --gpus-per-node=2080ti:1 --mem=10G --time=2:00:00
+sinfo -o '%20P %G' | sort -u   # partition → GRES (GPU types) it offers
 ```
 
-**Reserved partition (your account):**
+## Requesting GPUs
+
+**Checkpoint (preemptible, no account needed):** the partition is
+GPU-agnostic, so you specify GPU type via GRES.
+```bash
+salloc --partition=ckpt-all --gres=gpu:rtx6k:1 --mem=10G --time=2:00:00
+# equivalent modern form:
+salloc --partition=ckpt-all --gpus-per-node=rtx6k:1 --mem=10G --time=2:00:00
+```
+
+**Reserved partition (your account):** the partition itself is
+GPU-typed, so `--gpus=N` is enough.
 ```bash
 salloc --account=YOUR_ACCOUNT --partition=gpu-rtx6k --gpus=1 --mem=10G --time=2:00:00
 ```
 
 In sbatch scripts:
 ```
-#SBATCH --gpus=a40:2          # 2 A40 GPUs
-#SBATCH --gpus-per-node=1     # 1 GPU per node
+#SBATCH --gres=gpu:a40:2      # 2 A40 GPUs (works on any partition that has them)
+#SBATCH --gpus-per-node=1     # 1 GPU per node (type inferred from partition)
 ```
 
 ## Finding idle GPUs
@@ -809,27 +859,6 @@ def klone_run(cmd: str, timeout: int = 60) -> str:
     once saves repeated trial-and-error.
     """
     return run_ssh(cmd, timeout=timeout)
-
-
-@mcp.tool()
-@handle_ssh_errors
-def klone_put_file(path: str, content: str) -> str:
-    """
-    Create or overwrite a file on klone with the given content.
-
-    Content is piped via SSH stdin, so size is unlimited (no ARG_MAX
-    boundary) and shell metacharacters in `content` are not interpreted.
-
-    Use this for writing SLURM scripts, config files, small data files —
-    anything where you want exact bytes written verbatim. For very large
-    data files, use `rsync` or `scp` from the calling machine instead.
-
-    **If you're writing a SLURM script**, read `klone://help/jobs` first
-    for the partition catalog and `klone://help/checkpoint` if you're
-    planning to use ckpt-all (preemption handling is required).
-    """
-    safe_path = shlex.quote(path)
-    return run_ssh(f"cat > {safe_path}", stdin=content)
 
 
 if __name__ == "__main__":

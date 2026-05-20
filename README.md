@@ -1,13 +1,13 @@
 # klone-mcp
 
-A minimal MCP server for UW Hyak (klone). Exposes two tools — `klone_run`
-and `klone_put_file` — plus documentation resources covering klone's
-filesystem layout, SLURM conventions, and curated shell commands.
+A minimal MCP server for UW Hyak (klone). Exposes a single tool —
+`klone_run` — plus documentation resources covering klone's filesystem
+layout, SLURM conventions, and curated shell commands.
 
-Agents already know how to use `squeue`, `sacct`, `sbatch`, `du`, etc.
-This MCP doesn't wrap them. It just gives the agent a safe way to run
-commands on klone, write files, and find out what klone-specific
-utilities exist.
+Agents already know how to use `squeue`, `sacct`, `sbatch`, `du`, etc.,
+and they know bash (heredocs to write files, pipes, etc). This MCP
+doesn't wrap any of it. It just gives the agent a safe way to run
+commands on klone and find out what klone-specific utilities exist.
 
 If you want pre-typed wrappers around SLURM (`klone_squeue`, `klone_log`,
 `klone_submit`, …) checkout the [`structured-tools`](https://github.com/aurasoph/hyak-mcp/tree/structured-tools) branch.
@@ -107,6 +107,5 @@ terminal open, and ask the agent to retry.
 | Tool | Purpose |
 |------|---------|
 | `klone_run(cmd, timeout=60)` | Run any shell command on klone. Returns stdout. |
-| `klone_put_file(path, content)` | Write content to a remote path. Content piped via SSH stdin (no ARG_MAX limit). |
 
-Things like `df`, `du`, `sinfo`, `hyakalloc`, `scontrol`, `squeue`, `sacct`, `sbatch` are not separate tools — invoke them via `klone_run`. See the `klone://docs/commands` resource for a curated list.
+Things like `df`, `du`, `sinfo`, `hyakalloc`, `scontrol`, `squeue`, `sacct`, `sbatch` are not separate tools — invoke them via `klone_run`. See the `klone://docs/commands` resource for a curated list. To write a file, use a heredoc: `klone_run("cat > /tmp/x <<'EOF'\n...\nEOF")`.

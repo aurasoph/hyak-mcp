@@ -1,5 +1,4 @@
 import subprocess
-import shlex
 
 class DuoExpiredError(Exception):
     pass
@@ -9,13 +8,21 @@ class SSHCommandError(Exception):
 
 def detect_duo_expiry(stderr: str, returncode: int) -> bool:
     """Check if the error message indicates a Duo/SSH expiry securely."""
-    stderr = stderr.lower()
+    stderr_lower = stderr.lower()
+    # Strip benign auth-agent noise: this warning shows up on healthy SSH
+    # sessions whenever SSH_AUTH_SOCK is unset and is not a Duo signal.
+    cleaned = stderr_lower.replace(
+        "could not open a connection to your authentication agent.", ""
+    ).strip()
+    # If nothing remains after stripping the noise, it's not a Duo signal.
+    if not cleaned:
+        return False
     # 255 is the standard SSH exit code for auth failure/connection drop
     if returncode == 255:
         return True
-    if "(keyboard-interactive)" in stderr:
+    if "(keyboard-interactive)" in cleaned:
         return True
-    if "broken pipe" in stderr:
+    if "broken pipe" in cleaned:
         return True
     return False
 
@@ -44,6 +51,9 @@ def run_ssh(cmd: str, timeout: int = 60, stdin: str = None) -> str:
             if detect_duo_expiry(process.stderr, process.returncode):
                 raise DuoExpiredError(
                     "⚠️ klone SSH session has expired or is not configured.\n\n"
+                    "Diagnostic (does NOT trigger Duo): `ssh -O check klone` —\n"
+                    "if the ControlMaster is alive it prints 'Master running';\n"
+                    "anything else means the persistent session needs to be re-seeded.\n\n"
                     "Instructions for human:\n"
                     "1. If this is your first time, ensure your `~/.ssh/config` is set up exactly like this:\n"
                     "   Host klone klone-login\n"
