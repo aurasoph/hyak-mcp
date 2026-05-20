@@ -15,7 +15,22 @@ If you want pre-typed wrappers around SLURM (`klone_squeue`, `klone_log`,
 ## Prerequisites
 
 - Python 3.10+
-- The [parent `~/klone` SSH setup](../README.md) done (`ssh klone` succeeds without re-prompting Duo)
+- A working SSH alias `klone` on your machine. Add this block to `~/.ssh/config` if you don't have it (replace `YOUR_UWNETID`):
+
+  ```
+  Host klone
+      HostName klone.hyak.uw.edu
+      User YOUR_UWNETID
+      ControlMaster auto
+      ControlPath ~/.ssh/cm-%r@%h:%p
+      ControlPersist 10h
+      ServerAliveInterval 60
+  ```
+
+  Then run `ssh klone` once, complete the Duo push, and leave the
+  terminal open. The persistent connection means `ssh klone <cmd>` from
+  any other terminal won't re-prompt for the next 10 hours. The MCP
+  reuses this same connection.
 
 ## Install
 
@@ -87,71 +102,11 @@ Should return your NetID. If Duo expired, you'll get a structured re-auth
 prompt — open a terminal, do `ssh klone`, complete Duo, leave that
 terminal open, and ask the agent to retry.
 
-## Surface
-
-**Tools:**
+## Tools
 
 | Tool | Purpose |
 |------|---------|
 | `klone_run(cmd, timeout=60)` | Run any shell command on klone. Returns stdout. |
 | `klone_put_file(path, content)` | Write content to a remote path. Content piped via SSH stdin (no ARG_MAX limit). |
 
-**Resources** (read by the agent when relevant; sourced from official Hyak docs):
-
-- `klone://docs/quickstart` — storage hierarchy, SSD-staging performance pattern, Duo behavior, **index of the other resources**
-- `klone://docs/commands` — curated klone-specific shell commands (hyakalloc, hyakstorage, squeue, sacct, sbatch, scontrol, sinfo, apptainer, …)
-- `klone://help/jobs` — salloc/sbatch usage, partition catalog, arbiter2/login-node rule, pending reasons
-- `klone://help/checkpoint` — ckpt partitions: preemption, requeue, requeue intervals
-- `klone://help/monitoring` — watch running jobs, diagnose failures, post-mortem
-- `klone://help/arrays` — SLURM job arrays + parameter sweeps
-- `klone://help/containers` — apptainer best practices
-- `klone://help/modules` — LMOD module system
-- `klone://help/gpus` — GPU types, partitions, requesting in sbatch, NVIDIA NGC
-- `klone://help/python` — miniconda quotas + storage
-- `klone://help/r` — R / RStudio (containers, library paths)
-- `klone://help/matlab` — MATLAB (module, batch, parallel)
-- `klone://help/jupyter` — Jupyter (OOD, sbatch, manual conda)
-- `klone://help/ood` — Open OnDemand web portal
-
-Each `klone://help/*` resource carries a `*Reference: https://hyak.uw.edu/...*` link to its source page in the official Hyak docs so users (and agents) can follow up there for depth beyond what the resource summarizes.
-
-## Examples
-
-```python
-# Check the queue
-klone_run("squeue --me -o '%i|%j|%T|%M|%L'")
-
-# Submit a SLURM job (write the script, then sbatch it)
-klone_put_file("/gscratch/scrubbed/me/job.sh", """#!/bin/bash
-#SBATCH --account=mygroup
-#SBATCH --partition=ckpt-all
-#SBATCH --time=01:00:00
-#SBATCH --mem=4G
-echo hello from klone
-sleep 5
-""")
-klone_run("sbatch /gscratch/scrubbed/me/job.sh")
-
-# Tail a job log
-klone_run("scontrol show job 12345678 | grep -E 'StdOut|StdErr'")
-klone_run("tail -n 200 /path/to/slurm-12345678.out")
-```
-
-## Troubleshooting
-
-**`ModuleNotFoundError: klone_mcp`** — the Python being invoked by Claude
-isn't the one you ran `pip install -e .` against. Fix by pointing at the
-correct Python via absolute path in your config.
-
-**Tools not appearing in Claude session** — run `claude --debug 2>&1 | head -50`
-to see MCP startup logs. Almost always either a wrong `command` path or
-the server crashed on import.
-
-**Server crashes on import** — run `python -m klone_mcp.server 2>&1 | head -20`
-manually to see the traceback.
-
-**Every call returns Duo expired** — your SSH ControlMaster socket
-expired. From any terminal: `ssh klone`, do Duo, leave open. The MCP
-shares whatever socket your normal SSH uses.
-
-**`mcp dev` fails with `ImportError: attempted relative import with no known parent package`** — `pip install -e .` didn't run, or against a different Python than `mcp dev`. Verify with `which python` and `which mcp` showing the same prefix.
+Things like `df`, `du`, `sinfo`, `hyakalloc`, `scontrol`, `squeue`, `sacct`, `sbatch` are not separate tools — invoke them via `klone_run`. See the `klone://docs/commands` resource for a curated list.
