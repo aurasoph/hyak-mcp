@@ -50,16 +50,7 @@ uv venv && source .venv/bin/activate && uv pip install -e .
 
 ```bash
 ssh klone whoami        # must return your NetID — seed the SSH session first
-mcp dev klone_mcp/server.py
 ```
-
-The MCP Inspector opens in a browser tab. Call:
-
-- `klone_run` with `cmd="whoami"` — should return your NetID
-- Read resource `klone://docs/quickstart` — should return the storage/safety overview
-
-Kill with Ctrl+C when done.
-
 ## Register with Claude Code
 
 ```bash
