@@ -58,14 +58,22 @@ phases taking 10x longer than expected, `cp -a` of many small files
 through a FUSE mount, `lake exe cache get` slow.
 
 ## RUNNING COMPUTE
-This MCP exposes a single tool, `klone_run`, that runs any shell command
-on klone. You have all of bash and the klone-specific utilities listed
-in `klone://docs/commands` available.
+This MCP exposes two tools: `klone_run` (any shell command) and
+`klone_compute` (run commands on a named, reusable compute allocation).
+You have all of bash and the klone-specific utilities listed in
+`klone://docs/commands` available.
 
-- **Interactive:** `klone_run("salloc --partition=ckpt-all --cpus-per-task=1 --mem=10G --time=2:00:00")`
+- **Iterative compute (multiple commands on one node):** `klone_compute("dev", "hostname")`
+  — first call allocates, subsequent calls reuse. See `klone://help/jobs`.
+- **One-shot interactive:** `klone_run("salloc <flags> <command>")` — runs
+  the command on a compute node and releases. Always include a command;
+  `salloc` with no command tries to launch an interactive shell and will
+  hang the MCP call until timeout.
 - **Batch submit:** Write the script with a heredoc, then `sbatch` it — both in one `klone_run` call:
   `klone_run("cat > /tmp/job.sh <<'EOF'\\n#!/bin/bash\\n#SBATCH ...\\n<commands>\\nEOF\\nsbatch /tmp/job.sh")`
   The `'EOF'` (quoted) keeps the body verbatim — no `$var` expansion in the script body.
+  For scripts longer than ~100 KB, pass the body via the `stdin` arg of
+  `klone_run` to dodge ARG_MAX.
 - **Discovery:** `klone_run("hyakalloc")` for accounts, `klone_run("hyakstorage")` for quotas.
 
 ## AUTHENTICATION (DUO)
@@ -843,27 +851,25 @@ A web portal for klone at **https://ondemand.hyak.uw.edu/**.
 # --- Tools (Actions) ---
 
 def handle_ssh_errors(func):
-    """Catch SSH errors and turn them into a string the agent can act on."""
+    """Catch known SSH failure modes and return them as readable strings.
+
+    Other exceptions (ValueError on bad input, etc.) propagate so FastMCP
+    surfaces them as tool errors rather than silently mislabelling them
+    as "Unexpected Error".
+    """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except DuoExpiredError as e:
+        except (DuoExpiredError, SSHCommandError, TimeoutError) as e:
             return str(e)
-        except SSHCommandError as e:
-            return str(e)
-        except TimeoutError as e:
-            return str(e)
-        except Exception as e:
-            return f"Unexpected Error: {str(e)}"
     return wrapper
 
 
 @mcp.tool()
 @handle_ssh_errors
-def klone_run(cmd: str, timeout: int = 60) -> str:
-    """
-    Run a shell command on klone and return its stdout.
+def klone_run(cmd: str, timeout: int = 60, stdin: str | None = None) -> str:
+    """Run a shell command on klone and return its combined output.
 
     `cmd` is run by the remote shell, so pipes, redirects, and `&&` chains
     work. For everything beyond simple commands — SLURM job submission,
@@ -875,8 +881,17 @@ def klone_run(cmd: str, timeout: int = 60) -> str:
     For long-running work (compilation, training), submit a SLURM job
     via `sbatch` rather than running it directly.
 
-    `timeout` (seconds) controls how long to wait for the remote command.
-    Default 60. Bump for expensive queries like `du -sh /gscratch/...`.
+    `timeout` (seconds): how long to wait for the remote command. Default
+    60. Bump for expensive queries like `du -sh /gscratch/...`.
+
+    `stdin` (optional): string piped to the remote command's stdin. Use
+    this for large content (sbatch scripts, file bodies) instead of
+    embedding in `cmd`, which hits ARG_MAX (~128 KB on Linux). Pattern:
+        klone_run("cat > /tmp/job.sh", stdin="#!/bin/bash\\n...")
+
+    Output is capped at 1 MB per stream; further bytes are dropped with
+    a truncation marker. Successful stderr is appended to stdout (Lmod
+    and many tools write user-visible output to stderr).
 
     **First-time orientation**: if you haven't already, read
     `klone://docs/quickstart` — it covers the storage/quota layout, the
@@ -888,7 +903,66 @@ def klone_run(cmd: str, timeout: int = 60) -> str:
     # login shell and hang until the timeout fires.
     if not cmd or not cmd.strip():
         return ""
-    return run_ssh(cmd, timeout=timeout)
+    return run_ssh(cmd, timeout=timeout, stdin=stdin)
+
+
+def _validate_compute_name(name: str) -> None:
+    if not name or not name.strip():
+        raise ValueError("klone_compute: name must be non-empty")
+    if any(c in name for c in " \t\n'\"`;|&$<>()*?[]{}\\"):
+        raise ValueError(
+            f"klone_compute: invalid name {name!r} (no whitespace, quotes, or shell metachars)"
+        )
+
+
+def _find_existing_alloc(safe_name: str) -> str:
+    """Return the jobid of a RUNNING/CONFIGURING allocation with this name, or ''."""
+    out = run_ssh(
+        f'squeue --me --name={safe_name} -h -o "%i" --states=R,CF | head -1',
+        timeout=30,
+    )
+    return out.strip()
+
+
+def _create_alloc(safe_name: str, salloc_args: str, timeout: int) -> str:
+    """salloc a new allocation, wait for RUNNING, return the jobid.
+
+    Raises SSHCommandError if salloc fails or the allocation never reaches
+    RUNNING within the wait window.
+
+    `salloc_args` is intentionally not shell-quoted: it's a fragment of
+    SLURM flags that must word-split (e.g. "--partition=X --mem=Y" → two
+    args). The agent already has full bash via klone_run, so unquoted
+    args here are not a new attack surface.
+    """
+    recipe = f"""OUT=$(salloc --no-shell --job-name={safe_name} {salloc_args} 2>&1)
+RC=$?
+ID=$(echo "$OUT" | grep -oE 'job allocation [0-9]+' | awk '{{print $3}}')
+if [ $RC -ne 0 ] || [ -z "$ID" ]; then
+    echo "Allocation failed (salloc exit $RC). salloc output:" >&2
+    echo "$OUT" >&2
+    exit 2
+fi
+STATE=PENDING
+for _ in $(seq 1 60); do
+    STATE=$(squeue -j "$ID" -h -o "%T" 2>/dev/null)
+    [ "$STATE" = "RUNNING" ] && break
+    sleep 1
+done
+if [ "$STATE" != "RUNNING" ]; then
+    echo "Allocation $ID did not reach RUNNING within 60s (last state: $STATE). Cancelling." >&2
+    scancel "$ID" 2>/dev/null
+    exit 3
+fi
+echo "$ID"
+"""
+    out = run_ssh(recipe, timeout=timeout)
+    # Last non-empty line is the jobid; earlier lines may be salloc chatter.
+    for line in reversed(out.strip().splitlines()):
+        line = line.strip()
+        if line.isdigit():
+            return line
+    raise SSHCommandError(f"klone_compute: could not parse jobid from salloc output:\n{out}")
 
 
 @mcp.tool()
@@ -899,8 +973,7 @@ def klone_compute(
     salloc_args: str = "--partition=ckpt-all --cpus-per-task=4 --mem=10G --time=2:00:00",
     timeout: int = 120,
 ) -> str:
-    """
-    Run `cmd` on a named persistent compute allocation. Idempotent.
+    """Run `cmd` on a named persistent compute allocation. Idempotent.
 
     On the first call with a given `name`, runs
         salloc --no-shell --job-name=<name> <salloc_args>
@@ -912,13 +985,23 @@ def klone_compute(
     calls with the same name share the allocation's CPUs/GPUs/mem in
     parallel rather than queuing behind each other.
 
+    Note: this is a persistent *allocation*, not a persistent *shell*.
+    Each call is a fresh `srun ... bash -c <cmd>` — `cd`, `module load`,
+    `conda activate`, `export`, etc. do NOT persist across calls. Put
+    everything you need into the single `cmd` string (joined with `&&`
+    or `;`) or write a setup script once and source it each call.
+
     Use this for iterative compute-node work: short builds, GPU smoke
     tests, interactive Python on a real node, debugging across many
     commands. For one-shot long jobs use sbatch via klone_run.
 
-    To release: `klone_run("scancel -n <name>")` — or let walltime expire.
-    Walltime is the safety net; set `--time=` in `salloc_args`
-    appropriately.
+    To release: `klone_run("scancel -n <name>")` — but note this cancels
+    every job of yours with that name, not just this allocation. If
+    you're running multiple klone_compute names that might collide, use
+    unique names per allocation, or get the precise jobid first:
+        klone_run("squeue --me --name=<name> -h -o %i")
+    then `scancel <jobid>`. Walltime (`--time=` in `salloc_args`) is the
+    safety net if you forget — set it appropriately.
 
     **Before any sustained or multi-hour use, ASK THE HUMAN which account
     and partition they want.** Run `klone_run("hyakalloc")` first to
@@ -935,46 +1018,38 @@ def klone_compute(
             salloc_args="--partition=ckpt-all --gres=gpu:rtx6k:1 --mem=20G --time=2:00:00")
 
     Bump `timeout` if allocation grant is slow on a busy partition (the
-    internal wait loop is up to 60 s on top of cmd duration).
+    internal wait loop is up to 60 s on top of cmd duration). On srun
+    timeout, an allocation that was newly created in this call is
+    scancelled before re-raising; allocations that already existed are
+    left alone.
 
     See `klone://help/jobs` ("Interactive / persistent compute") for the
     underlying bash recipe.
     """
-    if not name or not name.strip():
-        raise ValueError("klone_compute: name must be non-empty")
-    if any(c in name for c in " \t\n'\"`;|&"):
-        raise ValueError(f"klone_compute: invalid name {name!r} (no whitespace, quotes, or shell metachars)")
+    _validate_compute_name(name)
     if not cmd or not cmd.strip():
         return ""
 
     safe_name = shlex.quote(name)
     safe_cmd = shlex.quote(cmd)
-    # salloc_args is intentionally NOT shell-quoted: it's a fragment of
-    # SLURM flags that must be word-split (e.g. "--partition=X --mem=Y" must
-    # become two args, not one). The agent already has full bash via
-    # klone_run, so unquoted args here are not a new attack surface.
-    # Don't use `set -e`: it aborts at `OUT=$(salloc ... 2>&1)` on salloc
-    # failure before the "Allocation failed" branch can surface the real
-    # error, leaving the caller with an opaque non-zero SSH exit.
-    recipe = f"""ID=$(squeue --me --name={safe_name} -h -o "%i" --states=R,CF | head -1)
-if [ -z "$ID" ]; then
-    OUT=$(salloc --no-shell --job-name={safe_name} {salloc_args} 2>&1)
-    RC=$?
-    ID=$(echo "$OUT" | grep -oE 'job allocation [0-9]+' | awk '{{print $3}}')
-    if [ $RC -ne 0 ] || [ -z "$ID" ]; then
-        echo "Allocation failed (salloc exit $RC). salloc output:" >&2
-        echo "$OUT" >&2
-        exit 2
-    fi
-    for _ in $(seq 1 60); do
-        STATE=$(squeue -j "$ID" -h -o "%T" 2>/dev/null)
-        [ "$STATE" = "RUNNING" ] && break
-        sleep 1
-    done
-fi
-srun --jobid="$ID" --overlap bash -c {safe_cmd}
-"""
-    return run_ssh(recipe, timeout=timeout)
+
+    jobid = _find_existing_alloc(safe_name)
+    created_this_call = False
+    if not jobid:
+        jobid = _create_alloc(safe_name, salloc_args, timeout)
+        created_this_call = True
+
+    srun_cmd = f'srun --jobid={shlex.quote(jobid)} --overlap bash -c {safe_cmd}'
+    try:
+        return run_ssh(srun_cmd, timeout=timeout)
+    except TimeoutError:
+        if created_this_call:
+            try:
+                run_ssh(f'scancel {shlex.quote(jobid)}', timeout=30)
+                logger.info("klone_compute timed out; cancelled freshly-allocated job %s", jobid)
+            except Exception as e:
+                logger.warning("klone_compute timeout cleanup failed for job %s: %s", jobid, e)
+        raise
 
 
 if __name__ == "__main__":
