@@ -9,12 +9,55 @@ import threading
 MAX_STREAM_BYTES = 1_048_576  # 1 MB
 
 
+_DUO_EXPIRED_MSG = (
+    "klone SSH session has expired or is not configured.\n\n"
+    "Diagnostic (does NOT trigger Duo): `ssh -O check klone` —\n"
+    "if the ControlMaster is alive it prints 'Master running';\n"
+    "anything else means the persistent session needs to be re-seeded.\n\n"
+    "Instructions for human:\n"
+    "1. If this is your first time, ensure your `~/.ssh/config` is set up exactly like this:\n"
+    "   Host klone klone-login\n"
+    "       HostName klone.hyak.uw.edu\n"
+    "       User YOUR_UWNETID\n"
+    "       ControlMaster auto\n"
+    "       ControlPath ~/.ssh/cm-%r@%h:%p\n"
+    "       ControlPersist 10h\n"
+    "       ServerAliveInterval 60\n"
+    "2. Open a terminal on your laptop.\n"
+    "3. Run: ssh klone\n"
+    "4. Complete the Duo push (if prompted).\n"
+    "5. Leave that terminal open.\n"
+    "6. Ask the agent to retry."
+)
+
+
 class DuoExpiredError(Exception):
     pass
 
 
 class SSHCommandError(Exception):
     pass
+
+
+def _control_master_alive(host: str) -> bool:
+    """Probe the persistent SSH ControlMaster for `host`.
+
+    Local socket check (`ssh -O check`); fast and never triggers Duo
+    even when the master is gone. Returns False on any failure so a
+    hanging or misconfigured probe is treated as "not alive" — which
+    gives the user the Duo reseed instructions, the right default for
+    a stuck SSH layer.
+    """
+    try:
+        result = subprocess.run(
+            ["ssh", "-O", "check", host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def detect_duo_expiry(stderr: str, returncode: int) -> bool:
@@ -104,6 +147,11 @@ def run_ssh(cmd: str, timeout: int = 60, stdin: str | None = None) -> str:
     write user-visible output to stderr; dropping it would silently lose
     `module avail` / `module list` results). Each stream is capped at
     1 MB; further bytes are dropped with a marker.
+
+    On timeout, probes the SSH ControlMaster — if it's dead, raises
+    `DuoExpiredError` (with reseed instructions) rather than a bare
+    `TimeoutError`. A hanging `whoami` is almost always a stale Duo
+    session, not a slow command.
     """
     host = os.environ.get("KLONE_SSH_HOST", "klone")
     full_cmd = ["ssh", host, cmd]
@@ -142,6 +190,12 @@ def run_ssh(cmd: str, timeout: int = 60, stdin: str | None = None) -> str:
         process.wait()
         t_out.join()
         t_err.join()
+        # A timeout with a dead ControlMaster is the classic Duo-expired
+        # signature: ssh hangs trying to open an interactive auth instead
+        # of failing fast. Surface the reseed instructions so the agent
+        # doesn't just retry blindly.
+        if not _control_master_alive(host):
+            raise DuoExpiredError(_DUO_EXPIRED_MSG)
         raise TimeoutError(f"Command timed out after {timeout} seconds.")
 
     t_out.join()
@@ -152,26 +206,7 @@ def run_ssh(cmd: str, timeout: int = 60, stdin: str | None = None) -> str:
 
     if process.returncode != 0:
         if detect_duo_expiry(stderr, process.returncode):
-            raise DuoExpiredError(
-                "klone SSH session has expired or is not configured.\n\n"
-                "Diagnostic (does NOT trigger Duo): `ssh -O check klone` —\n"
-                "if the ControlMaster is alive it prints 'Master running';\n"
-                "anything else means the persistent session needs to be re-seeded.\n\n"
-                "Instructions for human:\n"
-                "1. If this is your first time, ensure your `~/.ssh/config` is set up exactly like this:\n"
-                "   Host klone klone-login\n"
-                "       HostName klone.hyak.uw.edu\n"
-                "       User YOUR_UWNETID\n"
-                "       ControlMaster auto\n"
-                "       ControlPath ~/.ssh/cm-%r@%h:%p\n"
-                "       ControlPersist 10h\n"
-                "       ServerAliveInterval 60\n"
-                "2. Open a terminal on your laptop.\n"
-                "3. Run: ssh klone\n"
-                "4. Complete the Duo push (if prompted).\n"
-                "5. Leave that terminal open.\n"
-                "6. Ask the agent to retry."
-            )
+            raise DuoExpiredError(_DUO_EXPIRED_MSG)
 
         raise SSHCommandError(
             f"Error (Exit {process.returncode}):\n{stderr}\nStdout:\n{stdout}"
